@@ -52,7 +52,7 @@ export default function EditorPage() {
     if (isTranscribing) {
       setIsProcessing(true);
       setProcessingProgress(transcriptionProgress);
-      setProcessingMessage("Transcribing video with Deepgram AI...");
+      setProcessingMessage("Transcribing video with AI...");
     }
   }, [isTranscribing, transcriptionProgress]);
 
