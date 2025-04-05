@@ -361,21 +361,6 @@ export default function EditorPage() {
         return (
           <div className="flex flex-col h-full overflow-hidden">
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 h-full">
-              {/* <div className="lg:col-span-2 bg-gray-900 rounded-lg overflow-hidden">
-                {video && (
-                  <VideoPlayer
-                    src={previewUrl || video.url}
-                    subtitles={subtitles}
-                    currentTime={currentTime}
-                    isPlaying={isPlaying}
-                    onTimeUpdate={handleTimeUpdate}
-                    onPlayPause={handlePlayPause}
-                    style={subtitleStyle}
-                    ref={videoRef}
-                  />
-                )}
-              </div> */}
-
               {/* Video Preview Panel */}
               <div className="lg:col-span-2 bg-gray-900 rounded-lg overflow-hidden h-[60vh] flex items-center justify-center">
                 {video && (

@@ -125,8 +125,8 @@ export default function Home() {
                       Styling
                     </h3>
                     <p className="mt-2 text-sm text-gray-500">
-                      Match production grade exact subtitle styling with
-                      predefined profiles for professional results.
+                      Match exact subtitle styling with predefined profiles for
+                      professional results.
                     </p>
                   </div>
                 </div>
@@ -136,7 +136,7 @@ export default function Home() {
             <div className="bg-white overflow-hidden shadow rounded-lg">
               <div className="px-4 py-5 sm:p-6">
                 <div className="flex items-center">
-                  <div className="flex-shrink-0 bg-pink-600 rounded-md p-3">
+                  <div className="flex-shrink-0 bg-pink-500 rounded-md p-3">
                     <svg
                       className="h-6 w-6 text-white"
                       fill="none"
