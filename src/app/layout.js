@@ -5,7 +5,7 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata = {
-  title: "Netflix-Grade Subtitle Editor",
+  title: "Astro Subtitle Editor",
   description:
     "Create production-quality subtitles for your videos with AI-powered transcription and professional styling.",
 };
