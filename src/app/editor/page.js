@@ -492,8 +492,8 @@ export default function EditorPage() {
               Export Complete!
             </h2>
             <p className="text-gray-600 mb-8 text-center">
-              Your video with professional Netflix-style subtitles has been
-              created successfully.
+              Your video with professional subtitles has been created
+              successfully.
             </p>
             <div className="flex gap-4">
               <button

@@ -12,7 +12,7 @@ const execPromise = promisify(exec);
 
 // Create temp directory if it doesn't exist
 const ensureTempDir = async () => {
-  const tempDir = join(os.tmpdir(), "netflix-subtitle-editor");
+  const tempDir = join(os.tmpdir(), "astro-subtitle-editor");
   try {
     await mkdir(tempDir, { recursive: true });
     return tempDir;
