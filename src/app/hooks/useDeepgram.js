@@ -1,124 +1,3 @@
-// // File: hooks/useDeepgram.js
-// "use client";
-
-// import { useState, useEffect } from "react";
-// import { v4 as uuidv4 } from "uuid";
-
-// export default function useDeepgram() {
-//   const [isProcessing, setIsProcessing] = useState(false);
-//   const [progress, setProgress] = useState(0);
-//   const [error, setError] = useState(null);
-//   const [jobId, setJobId] = useState(null);
-
-//   // Function to transcribe video
-//   const transcribeVideo = async (videoFile, language = "en") => {
-//     try {
-//       setIsProcessing(true);
-//       setProgress(0);
-//       setError(null);
-
-//       // Generate a unique job ID
-//       const newJobId = uuidv4();
-//       setJobId(newJobId);
-
-//       // Create FormData with the video file
-//       const formData = new FormData();
-//       formData.append("file", videoFile);
-//       formData.append("language", language);
-//       formData.append("jobId", newJobId);
-
-//       // Start progress tracking
-//       const progressTracker = startProgressTracking(newJobId);
-
-//       // Call the transcription API
-//       const response = await fetch("/api/transcribe", {
-//         method: "POST",
-//         body: formData,
-//       });
-
-//       // Clear progress tracker
-//       clearInterval(progressTracker);
-
-//       if (!response.ok) {
-//         const errorData = await response.json();
-//         throw new Error(errorData.error || "Transcription failed");
-//       }
-
-//       // Update progress to 100%
-//       setProgress(100);
-
-//       // Parse response
-//       const data = await response.json();
-
-//       setIsProcessing(false);
-//       return data;
-//     } catch (err) {
-//       setError(err.message || "Error transcribing video");
-//       setIsProcessing(false);
-//       throw err;
-//     }
-//   };
-
-//   // Function to start tracking progress
-//   const startProgressTracking = (jobId) => {
-//     // Simulate progress updates
-//     // In a real implementation, this would poll an API endpoint
-//     let currentProgress = 0;
-
-//     const progressInterval = setInterval(async () => {
-//       try {
-//         // Fetch real progress from the API
-//         const response = await fetch(`/api/progress?jobId=${jobId}`);
-
-//         if (response.ok) {
-//           const progressData = await response.json();
-//           setProgress(progressData.progress || Math.min(currentProgress, 95));
-
-//           // If job is complete, clear interval
-//           if (
-//             progressData.status === "completed" ||
-//             progressData.status === "failed"
-//           ) {
-//             clearInterval(progressInterval);
-
-//             if (progressData.status === "failed") {
-//               setError(progressData.message || "Transcription failed");
-//             }
-//           }
-//         } else {
-//           // Fallback to simulated progress if API fails
-//           currentProgress += 5;
-//           setProgress(Math.min(currentProgress, 95));
-//         }
-//       } catch (err) {
-//         console.error("Error tracking progress:", err);
-//         // Fallback to simulated progress
-//         currentProgress += 5;
-//         setProgress(Math.min(currentProgress, 95));
-//       }
-//     }, 1000);
-
-//     return progressInterval;
-//   };
-
-//   // Cleanup on unmount
-//   useEffect(() => {
-//     return () => {
-//       if (jobId) {
-//         // Cancel any in-progress jobs if component unmounts
-//         // This would require a backend endpoint in a real implementation
-//       }
-//     };
-//   }, [jobId]);
-
-//   return {
-//     transcribeVideo,
-//     isProcessing,
-//     progress,
-//     error,
-//   };
-// }
-
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
@@ -129,43 +8,62 @@ export default function useDeepgram() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState(null);
   const [jobId, setJobId] = useState(null);
+  const [status, setStatus] = useState("idle");
+  const [message, setMessage] = useState("");
 
   // Function to transcribe video
-  const transcribeVideo = useCallback(async (videoFile, language = "en") => {
-    console.log("Starting video transcription process");
+  const transcribeVideo = useCallback(async (mediaFile, language = "en") => {
+    console.log("Starting media transcription process");
+    const fileSize = mediaFile.size;
+    const isLargeFile = fileSize > 100 * 1024 * 1024; // Over 100MB
 
     try {
       // Reset state
       setIsProcessing(true);
       setProgress(0);
       setError(null);
+      setStatus("initializing");
+      setMessage(
+        isLargeFile
+          ? "Preparing large file for transcription..."
+          : "Preparing file for transcription..."
+      );
 
       // Generate a unique job ID
       const newJobId = uuidv4();
       setJobId(newJobId);
       console.log(`Generated Job ID: ${newJobId}`);
 
-      // Create FormData with the video file
+      // Create FormData with the media file
       const formData = new FormData();
-      formData.append("file", videoFile);
+      formData.append("file", mediaFile);
       formData.append("language", language);
       formData.append("jobId", newJobId);
 
       // Start progress tracking
-      const progressTracker = startProgressTracking(newJobId);
+      const progressTracker = startProgressTracking(newJobId, isLargeFile);
+
+      // Initial progress update
+      setProgress(5);
+      setStatus("uploading");
+      setMessage(
+        isLargeFile
+          ? "Uploading large file (this may take a while)..."
+          : "Uploading file..."
+      );
 
       // Call the transcription API
-      console.log("Sending transcription request to API");
+      console.log(
+        `Sending transcription request to API for ${fileSize} bytes file`
+      );
       const response = await fetch("/api/transcribe", {
         method: "POST",
         body: formData,
       });
 
-      // Clear progress tracker
-      clearInterval(progressTracker);
-
       // Check response
       if (!response.ok) {
+        clearInterval(progressTracker);
         const errorData = await response.json();
         console.error("Transcription API error:", errorData);
         throw new Error(
@@ -177,16 +75,35 @@ export default function useDeepgram() {
       const data = await response.json();
       console.log("Transcription response received:", data);
 
+      // Set the job ID from the response if available
+      if (data.jobId) {
+        setJobId(data.jobId);
+      }
+
+      // For large files, continue tracking progress
+      // Otherwise, clear the interval
+      if (!isLargeFile) {
+        clearInterval(progressTracker);
+      }
+
       // Validate response
       if (!data.subtitles || data.subtitles.length === 0) {
+        setError("No subtitles were generated");
         throw new Error("No subtitles were generated");
       }
 
-      // Update progress to 100%
-      setProgress(100);
-      setIsProcessing(false);
-
-      return data;
+      // Check if we need to wait for the transcription to complete
+      if (data.status === "processing" && data.jobId) {
+        // Continue tracking progress until completion
+        return await waitForCompletion(data.jobId, progressTracker);
+      } else {
+        // Update progress to 100%
+        setProgress(100);
+        setStatus("completed");
+        setMessage("Transcription completed successfully");
+        setIsProcessing(false);
+        return data;
+      }
     } catch (err) {
       console.error("Transcription error:", err);
 
@@ -197,6 +114,8 @@ export default function useDeepgram() {
           : "An unexpected error occurred during transcription";
 
       setError(errorMessage);
+      setStatus("failed");
+      setMessage(`Transcription failed: ${errorMessage}`);
       setIsProcessing(false);
 
       // Re-throw to allow caller to handle
@@ -204,12 +123,80 @@ export default function useDeepgram() {
     }
   }, []);
 
+  // Function to wait for job completion
+  const waitForCompletion = async (jobId, progressTracker) => {
+    console.log(`Waiting for completion of job ${jobId}`);
+
+    try {
+      // Continue checking until job is completed or failed
+      let isJobCompleted = false;
+      let result = null;
+
+      while (!isJobCompleted) {
+        // Wait 2 seconds between checks
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+
+        // Check job status
+        const response = await fetch(`/api/progress?jobId=${jobId}`);
+
+        if (response.ok) {
+          const data = await response.json();
+
+          if (data.status === "completed") {
+            clearInterval(progressTracker);
+            setProgress(100);
+            setStatus("completed");
+            setMessage("Transcription completed successfully");
+            isJobCompleted = true;
+
+            // Fetch the result
+            const resultResponse = await fetch(
+              `/api/transcribe/result?jobId=${jobId}`
+            );
+            if (resultResponse.ok) {
+              result = await resultResponse.json();
+            } else {
+              throw new Error("Failed to fetch transcription result");
+            }
+          } else if (data.status === "failed") {
+            clearInterval(progressTracker);
+            throw new Error(data.message || "Transcription failed");
+          }
+
+          // Update progress
+          setProgress(data.progress || 0);
+          setStatus(data.status || "processing");
+          setMessage(data.message || "Processing your media file...");
+        } else {
+          console.warn("Failed to check job status");
+        }
+      }
+
+      setIsProcessing(false);
+      return result;
+    } catch (error) {
+      clearInterval(progressTracker);
+      setError(error.message);
+      setStatus("failed");
+      setMessage(`Transcription failed: ${error.message}`);
+      setIsProcessing(false);
+      throw error;
+    }
+  };
+
   // Function to start tracking progress
-  const startProgressTracking = (jobId) => {
+  const startProgressTracking = (jobId, isLargeFile) => {
     console.log(`Starting progress tracking for job ${jobId}`);
     let currentProgress = 0;
     let errorCount = 0;
     const MAX_ERROR_RETRIES = 5;
+
+    // For large files, we'll check progress more frequently
+    const checkInterval = isLargeFile ? 1000 : 2000;
+
+    // Different progress simulation rates for different file sizes
+    const progressIncrement = isLargeFile ? 2 : 5;
+    const maxSimulatedProgress = isLargeFile ? 90 : 95;
 
     const progressInterval = setInterval(async () => {
       try {
@@ -221,10 +208,23 @@ export default function useDeepgram() {
           console.log("Progress data:", progressData);
 
           // Update progress
-          const newProgress =
-            progressData.progress || Math.min(currentProgress + 10, 95);
-          setProgress(newProgress);
-          currentProgress = newProgress;
+          if (progressData.progress !== undefined) {
+            setProgress(progressData.progress);
+            currentProgress = progressData.progress;
+          } else {
+            // Simulate progress if not provided
+            currentProgress += progressIncrement;
+            setProgress(Math.min(currentProgress, maxSimulatedProgress));
+          }
+
+          // Update status and message
+          if (progressData.status) {
+            setStatus(progressData.status);
+          }
+
+          if (progressData.message) {
+            setMessage(progressData.message);
+          }
 
           // Check job status
           if (
@@ -247,8 +247,8 @@ export default function useDeepgram() {
           console.warn(`Progress fetch failed (attempt ${errorCount})`);
 
           // Simulate progress
-          currentProgress += 5;
-          setProgress(Math.min(currentProgress, 95));
+          currentProgress += progressIncrement / 2; // Slower progress during errors
+          setProgress(Math.min(currentProgress, maxSimulatedProgress));
 
           // Stop trying after max retries
           if (errorCount >= MAX_ERROR_RETRIES) {
@@ -263,8 +263,8 @@ export default function useDeepgram() {
         errorCount++;
 
         // Simulate progress
-        currentProgress += 5;
-        setProgress(Math.min(currentProgress, 95));
+        currentProgress += progressIncrement / 2; // Slower progress during errors
+        setProgress(Math.min(currentProgress, maxSimulatedProgress));
 
         // Stop trying after max retries
         if (errorCount >= MAX_ERROR_RETRIES) {
@@ -272,7 +272,7 @@ export default function useDeepgram() {
           setError("Failed to track transcription progress");
         }
       }
-    }, 1000);
+    }, checkInterval);
 
     return progressInterval;
   };
@@ -292,6 +292,8 @@ export default function useDeepgram() {
     isProcessing,
     progress,
     error,
+    status,
+    message,
     jobId,
   };
 }
