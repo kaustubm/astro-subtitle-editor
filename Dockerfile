@@ -62,7 +62,7 @@ COPY package.json package-lock.json* ./
 
 # Install AWS SDK dependencies
 RUN npm ci
-RUN npm install @aws-sdk/client-s3 --save
+# RUN npm install @aws-sdk/client-s3 --save
 
 # Build the app
 FROM base AS builder
