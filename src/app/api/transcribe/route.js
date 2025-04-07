@@ -213,36 +213,6 @@ const convertSrtToSubtitles = (srtContent) => {
   });
 };
 
-// For large files, we directly stream to Deepgram from disk
-const transcribeWithDeepgram = async (filePath, options) => {
-  try {
-    const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
-
-    // Use file read stream instead of loading entire file into memory
-    const fileStream = fs.createReadStream(filePath);
-
-    // Set a longer timeout for large files (30 minutes)
-    const timeoutMs = 30 * 60 * 1000;
-
-    // Using stream transcription instead of file upload
-    const { result, error } =
-      await deepgram.listen.prerecorded.transcribeStream(fileStream, {
-        ...options,
-        _timeout: timeoutMs,
-      });
-
-    if (error) {
-      console.error("Deepgram API error:", error);
-      throw new Error(`Deepgram API error: ${error.message}`);
-    }
-
-    return result;
-  } catch (error) {
-    console.error("Transcription error:", error);
-    throw error;
-  }
-};
-
 export async function POST(request) {
   let filePath = null;
   let srtPath = null;
@@ -256,14 +226,24 @@ export async function POST(request) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 });
     }
 
-    // Get file size
-    const fileSize = file.size;
-    console.log(`Processing file of size: ${fileSize} bytes`);
+    console.log(`Processing file: ${file.name}, size: ${file.size} bytes`);
 
-    // Stream file to disk to avoid memory issues
+    // Stream file to disk instead of loading it all into memory
     const uniqueFileName = `${uuidv4()}-${file.name}`;
     filePath = await streamToDisk(file, uniqueFileName);
-    console.log(`File saved to: ${filePath}`);
+    console.log(`File saved to disk at: ${filePath}`);
+
+    // Initialize Deepgram client
+    const deepgram = createClient(process.env.DEEPGRAM_API_KEY, {
+      global: {
+        fetch: {
+          options: {
+            // Set a longer timeout for large files
+            timeout: 30 * 60 * 1000, // 30 minutes
+          },
+        },
+      },
+    });
 
     // Configure transcription options
     const options = {
@@ -275,10 +255,22 @@ export async function POST(request) {
       language: language,
     };
 
-    console.log(`Starting transcription with options:`, options);
+    console.log("Reading file for Deepgram processing...");
+    const fileContent = await readFile(filePath);
+    console.log(`File read complete. Size: ${fileContent.length} bytes`);
 
-    // Use streaming transcription for large files
-    const result = await transcribeWithDeepgram(filePath, options);
+    console.log("Starting transcription with Deepgram...");
+    // Use the transcribeFile method with the file buffer
+    const { result, error } = await deepgram.listen.prerecorded.transcribeFile(
+      fileContent,
+      options
+    );
+
+    if (error) {
+      console.error("Deepgram API error:", error);
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+
     console.log("Transcription completed successfully");
 
     // Use the built-in SRT formatter from Deepgram
@@ -293,7 +285,6 @@ export async function POST(request) {
     // Convert SRT to our app's subtitle format
     const subtitles = convertSrtToSubtitles(srtContent);
 
-    // Return the response
     const response = {
       subtitles,
       srtContent,
@@ -302,6 +293,22 @@ export async function POST(request) {
       confidence:
         result.results?.channels?.[0]?.alternatives?.[0]?.confidence || 0,
     };
+
+    // Schedule cleanup of temporary files after response is sent
+    setTimeout(async () => {
+      if (filePath) {
+        const deleted = await deleteFile(filePath);
+        console.log(
+          `File cleanup ${deleted ? "successful" : "failed"}: ${filePath}`
+        );
+      }
+      if (srtPath) {
+        const deleted = await deleteFile(srtPath);
+        console.log(
+          `SRT cleanup ${deleted ? "successful" : "failed"}: ${srtPath}`
+        );
+      }
+    }, 5000); // 5 second delay to ensure response is completely sent
 
     return NextResponse.json(response);
   } catch (error) {
@@ -318,14 +325,5 @@ export async function POST(request) {
       },
       { status: 500 }
     );
-  } finally {
-    // Schedule cleanup after response is sent (files persist until response is received by client)
-    if (filePath || srtPath) {
-      console.log("Scheduling cleanup of temporary files...");
-      setTimeout(async () => {
-        if (filePath) await deleteFile(filePath);
-        if (srtPath) await deleteFile(srtPath);
-      }, 5000); // 5 second delay to ensure response is completely sent
-    }
   }
 }
