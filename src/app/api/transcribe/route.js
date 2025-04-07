@@ -138,11 +138,30 @@ import Parser from "srt-parser-2";
 import { pipeline } from "stream/promises";
 import fs from "fs";
 
+// AWS SDK imports
+import {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
+
+// Create an S3 client using EC2 instance role
+const s3Client = new S3Client({
+  region: process.env.AWS_REGION || "ap-southeast-1",
+  // When deployed to EC2 with an instance profile, no explicit credentials are needed
+  // The SDK will automatically use the EC2 instance role credentials
+});
+
+// S3 bucket configuration
+const S3_BUCKET = process.env.S3_BUCKET || "deepgram-transcription";
+const S3_FOLDER = "temp-uploads/";
+
 // Create temp directory if it doesn't exist
 const ensureTempDir = async () => {
   const tempDir = join(os.tmpdir(), "astro-subtitle-editor");
   try {
     await mkdir(tempDir, { recursive: true });
+    console.log(`Temporary directory created at: ${tempDir}`);
     return tempDir;
   } catch (error) {
     console.error("Error creating temp directory:", error);
@@ -213,9 +232,73 @@ const convertSrtToSubtitles = (srtContent) => {
   });
 };
 
+// Upload file to S3 and return the URL
+const uploadToS3 = async (filePath, fileName) => {
+  try {
+    const fileContent = await readFile(filePath);
+    const fileKey = `${S3_FOLDER}${uuidv4()}-${fileName}`;
+
+    // Get content type based on file extension
+    let contentType = "application/octet-stream";
+    if (fileName.endsWith(".mp4")) contentType = "video/mp4";
+    else if (fileName.endsWith(".mp3")) contentType = "audio/mpeg";
+    else if (fileName.endsWith(".wav")) contentType = "audio/wav";
+    else if (fileName.endsWith(".avi")) contentType = "video/x-msvideo";
+    else if (fileName.endsWith(".mov")) contentType = "video/quicktime";
+
+    // Upload to S3
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: fileKey,
+        Body: fileContent,
+        ContentType: contentType,
+      })
+    );
+
+    console.log(`File uploaded to S3: ${fileKey}`);
+
+    // Create S3 URL
+    const url = `https://${S3_BUCKET}.s3.${
+      process.env.AWS_REGION || "ap-southeast-1"
+    }.amazonaws.com/${fileKey}`;
+
+    return {
+      url,
+      fileKey,
+    };
+  } catch (error) {
+    console.error("Error uploading to S3:", error);
+    throw new Error(`Failed to upload to S3: ${error.message}`);
+  }
+};
+
+// Delete file from S3 after processing
+const deleteFromS3 = async (fileKey) => {
+  try {
+    await s3Client.send(
+      new DeleteObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: fileKey,
+      })
+    );
+    console.log(`Successfully deleted from S3: ${fileKey}`);
+    return true;
+  } catch (error) {
+    console.error(`Error deleting from S3 ${fileKey}:`, error);
+    return false;
+  }
+};
+
+// Determine if we should use the S3 approach based on file size
+const isLargeFile = (size) => {
+  return size > 50 * 1024 * 1024; // 50MB threshold
+};
+
 export async function POST(request) {
   let filePath = null;
   let srtPath = null;
+  let s3FileKey = null;
 
   try {
     const formData = await request.formData();
@@ -226,19 +309,24 @@ export async function POST(request) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 });
     }
 
-    console.log(`Processing file: ${file.name}, size: ${file.size} bytes`);
+    const fileSize = file.size;
+    console.log(
+      `Processing file: ${file.name}, size: ${fileSize} bytes (${(
+        fileSize /
+        (1024 * 1024)
+      ).toFixed(2)} MB)`
+    );
 
-    // Stream file to disk instead of loading it all into memory
+    // Stream file to disk to avoid memory issues
     const uniqueFileName = `${uuidv4()}-${file.name}`;
     filePath = await streamToDisk(file, uniqueFileName);
     console.log(`File saved to disk at: ${filePath}`);
 
-    // Initialize Deepgram client
+    // Initialize Deepgram client with longer timeout
     const deepgram = createClient(process.env.DEEPGRAM_API_KEY, {
       global: {
         fetch: {
           options: {
-            // Set a longer timeout for large files
             timeout: 30 * 60 * 1000, // 30 minutes
           },
         },
@@ -255,20 +343,43 @@ export async function POST(request) {
       language: language,
     };
 
-    console.log("Reading file for Deepgram processing...");
-    const fileContent = await readFile(filePath);
-    console.log(`File read complete. Size: ${fileContent.length} bytes`);
+    let result;
 
-    console.log("Starting transcription with Deepgram...");
-    // Use the transcribeFile method with the file buffer
-    const { result, error } = await deepgram.listen.prerecorded.transcribeFile(
-      fileContent,
-      options
-    );
+    if (isLargeFile(fileSize)) {
+      console.log("Using S3 URL-based processing for large file");
 
-    if (error) {
-      console.error("Deepgram API error:", error);
-      return NextResponse.json({ error: error.message }, { status: 500 });
+      // Upload to S3 and get URL
+      const { url, fileKey } = await uploadToS3(filePath, file.name);
+      s3FileKey = fileKey;
+
+      console.log(`Processing file from S3 URL: ${url}`);
+
+      // Use URL-based transcription
+      const { result: urlResult, error } =
+        await deepgram.listen.prerecorded.transcribeUrl({ url }, options);
+
+      if (error) {
+        throw new Error(`Deepgram API error: ${error.message}`);
+      }
+
+      result = urlResult;
+
+      // We can delete the local file now since S3 has it
+      await deleteFile(filePath);
+      filePath = null;
+    } else {
+      console.log("Using direct file processing for smaller file");
+      const fileContent = await readFile(filePath);
+      console.log(`File read complete. Size: ${fileContent.length} bytes`);
+
+      const { result: fileResult, error } =
+        await deepgram.listen.prerecorded.transcribeFile(fileContent, options);
+
+      if (error) {
+        throw new Error(`Deepgram API error: ${error.message}`);
+      }
+
+      result = fileResult;
     }
 
     console.log("Transcription completed successfully");
@@ -285,6 +396,7 @@ export async function POST(request) {
     // Convert SRT to our app's subtitle format
     const subtitles = convertSrtToSubtitles(srtContent);
 
+    // Return the response
     const response = {
       subtitles,
       srtContent,
@@ -294,21 +406,12 @@ export async function POST(request) {
         result.results?.channels?.[0]?.alternatives?.[0]?.confidence || 0,
     };
 
-    // Schedule cleanup of temporary files after response is sent
+    // Schedule cleanup of temporary files and S3 objects
     setTimeout(async () => {
-      if (filePath) {
-        const deleted = await deleteFile(filePath);
-        console.log(
-          `File cleanup ${deleted ? "successful" : "failed"}: ${filePath}`
-        );
-      }
-      if (srtPath) {
-        const deleted = await deleteFile(srtPath);
-        console.log(
-          `SRT cleanup ${deleted ? "successful" : "failed"}: ${srtPath}`
-        );
-      }
-    }, 5000); // 5 second delay to ensure response is completely sent
+      if (filePath) await deleteFile(filePath);
+      if (srtPath) await deleteFile(srtPath);
+      if (s3FileKey) await deleteFromS3(s3FileKey);
+    }, 5000);
 
     return NextResponse.json(response);
   } catch (error) {
@@ -317,6 +420,7 @@ export async function POST(request) {
     // Clean up files if there was an error
     if (filePath) await deleteFile(filePath);
     if (srtPath) await deleteFile(srtPath);
+    if (s3FileKey) await deleteFromS3(s3FileKey);
 
     return NextResponse.json(
       {
