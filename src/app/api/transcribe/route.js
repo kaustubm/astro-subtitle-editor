@@ -131,7 +131,6 @@ import { createClient } from "@deepgram/sdk";
 import { srt } from "@deepgram/captions";
 import { writeFile, unlink, readFile } from "fs/promises";
 import { mkdir } from "fs/promises";
-import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import { join } from "path";
 import os from "os";
@@ -173,8 +172,10 @@ const deleteFile = async (filePath) => {
   try {
     await unlink(filePath);
     console.log(`Successfully deleted: ${filePath}`);
+    return true;
   } catch (error) {
     console.error(`Error deleting file ${filePath}:`, error);
+    return false;
   }
 };
 
@@ -212,6 +213,36 @@ const convertSrtToSubtitles = (srtContent) => {
   });
 };
 
+// For large files, we directly stream to Deepgram from disk
+const transcribeWithDeepgram = async (filePath, options) => {
+  try {
+    const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
+
+    // Use file read stream instead of loading entire file into memory
+    const fileStream = fs.createReadStream(filePath);
+
+    // Set a longer timeout for large files (30 minutes)
+    const timeoutMs = 30 * 60 * 1000;
+
+    // Using stream transcription instead of file upload
+    const { result, error } =
+      await deepgram.listen.prerecorded.transcribeStream(fileStream, {
+        ...options,
+        _timeout: timeoutMs,
+      });
+
+    if (error) {
+      console.error("Deepgram API error:", error);
+      throw new Error(`Deepgram API error: ${error.message}`);
+    }
+
+    return result;
+  } catch (error) {
+    console.error("Transcription error:", error);
+    throw error;
+  }
+};
+
 export async function POST(request) {
   let filePath = null;
   let srtPath = null;
@@ -225,19 +256,18 @@ export async function POST(request) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 });
     }
 
-    // Stream file to disk instead of loading it all into memory
+    // Get file size
+    const fileSize = file.size;
+    console.log(`Processing file of size: ${fileSize} bytes`);
+
+    // Stream file to disk to avoid memory issues
     const uniqueFileName = `${uuidv4()}-${file.name}`;
     filePath = await streamToDisk(file, uniqueFileName);
-
-    // Initialize Deepgram client
-    const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
-
-    // Determine which model to use based on language
-    const model = language === "en" ? "nova-3" : "nova-2";
+    console.log(`File saved to: ${filePath}`);
 
     // Configure transcription options
     const options = {
-      model: model,
+      model: language === "en" ? "nova-3" : "nova-2",
       smart_format: true,
       utterances: false,
       punctuate: true,
@@ -245,19 +275,11 @@ export async function POST(request) {
       language: language,
     };
 
-    // Read the file from disk and send to Deepgram
-    const fileBuffer = await readFile(filePath);
+    console.log(`Starting transcription with options:`, options);
 
-    // Send audio file to Deepgram for transcription
-    const { result, error } = await deepgram.listen.prerecorded.transcribeFile(
-      fileBuffer,
-      options
-    );
-
-    if (error) {
-      console.error("Deepgram API error:", error);
-      return NextResponse.json({ error: error.message }, { status: 500 });
-    }
+    // Use streaming transcription for large files
+    const result = await transcribeWithDeepgram(filePath, options);
+    console.log("Transcription completed successfully");
 
     // Use the built-in SRT formatter from Deepgram
     const srtContent = srt(result);
@@ -266,27 +288,44 @@ export async function POST(request) {
     const srtFileName = `${uuidv4()}.srt`;
     srtPath = join(await ensureTempDir(), srtFileName);
     await writeFile(srtPath, srtContent);
+    console.log(`SRT file saved to: ${srtPath}`);
 
     // Convert SRT to our app's subtitle format
     const subtitles = convertSrtToSubtitles(srtContent);
 
     // Return the response
-    return NextResponse.json({
+    const response = {
       subtitles,
       srtContent,
       srtPath,
       filePath,
       confidence:
         result.results?.channels?.[0]?.alternatives?.[0]?.confidence || 0,
-    });
+    };
+
+    return NextResponse.json(response);
   } catch (error) {
     console.error("Transcription error:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+
+    // Clean up files if there was an error
+    if (filePath) await deleteFile(filePath);
+    if (srtPath) await deleteFile(srtPath);
+
+    return NextResponse.json(
+      {
+        error: error.message || "Unknown error during transcription",
+        details: error.toString(),
+      },
+      { status: 500 }
+    );
   } finally {
-    // Clean up temporary files after response is sent
-    setTimeout(async () => {
-      if (filePath) await deleteFile(filePath);
-      if (srtPath) await deleteFile(srtPath);
-    }, 1000); // Small delay to ensure response is sent
+    // Schedule cleanup after response is sent (files persist until response is received by client)
+    if (filePath || srtPath) {
+      console.log("Scheduling cleanup of temporary files...");
+      setTimeout(async () => {
+        if (filePath) await deleteFile(filePath);
+        if (srtPath) await deleteFile(srtPath);
+      }, 5000); // 5 second delay to ensure response is completely sent
+    }
   }
 }
