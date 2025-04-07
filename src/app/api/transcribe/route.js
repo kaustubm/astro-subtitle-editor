@@ -130,22 +130,24 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@deepgram/sdk";
 import { srt } from "@deepgram/captions";
-import { writeFile } from "fs/promises";
+import { writeFile, unlink } from "fs/promises";
 import { mkdir } from "fs/promises";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import { join } from "path";
 import os from "os";
 import Parser from "srt-parser-2";
-import { Readable } from "stream";
+import fs from "fs";
+import { promisify } from "util";
+import { exec } from "child_process";
 
-// Configure API route for large file handling
-export const config = {
-  api: {
-    bodyParser: false,
-    responseLimit: false,
-  },
-};
+const execAsync = promisify(exec);
+const readdir = promisify(fs.readdir);
+const stat = promisify(fs.stat);
+
+// Set a larger body size limit
+export const dynamic = "force-dynamic";
+export const maxDuration = 300; // 5 minutes
 
 // Create temp directory if it doesn't exist
 const ensureTempDir = async () => {
@@ -165,6 +167,44 @@ const saveToDisk = async (buffer, filename) => {
   const filePath = join(tempDir, filename);
   await writeFile(filePath, buffer);
   return filePath;
+};
+
+// Function to clean up old temp files
+const cleanupTempFiles = async (maxAgeHours = 24) => {
+  try {
+    const tempDir = await ensureTempDir();
+    const files = await readdir(tempDir);
+    const now = Date.now();
+    const maxAgeMs = maxAgeHours * 60 * 60 * 1000;
+
+    let cleanedCount = 0;
+    let cleanedBytes = 0;
+
+    for (const file of files) {
+      const filePath = join(tempDir, file);
+      const fileStat = await stat(filePath);
+
+      // Check if file is older than maxAgeHours
+      if (now - fileStat.mtime.getTime() > maxAgeMs) {
+        cleanedBytes += fileStat.size;
+        await unlink(filePath);
+        cleanedCount++;
+      }
+    }
+
+    if (cleanedCount > 0) {
+      console.log(
+        `Cleaned up ${cleanedCount} files (${(
+          cleanedBytes /
+          1024 /
+          1024
+        ).toFixed(2)} MB) older than ${maxAgeHours} hours`
+      );
+    }
+  } catch (error) {
+    console.error("Error cleaning up temp files:", error);
+    // Non-fatal error, continue execution
+  }
 };
 
 // Function to parse SRT time format to seconds
@@ -198,16 +238,11 @@ const convertSrtToSubtitles = (srtContent) => {
   });
 };
 
-// Extract audio from video file (optional for large files)
+// Extract audio from video file
 const extractAudioFromVideo = async (videoPath) => {
   try {
     const outputPath = videoPath + ".mp3";
-    // Use ffmpeg to extract audio only - more efficient for Deepgram processing
-    const { exec } = require("child_process");
-    const { promisify } = require("util");
-    const execPromise = promisify(exec);
-
-    await execPromise(
+    await execAsync(
       `ffmpeg -i "${videoPath}" -vn -acodec libmp3lame -q:a 4 "${outputPath}"`
     );
     return outputPath;
@@ -217,8 +252,41 @@ const extractAudioFromVideo = async (videoPath) => {
   }
 };
 
+// Check available disk space
+const checkDiskSpace = async () => {
+  try {
+    const { stdout } = await execAsync("df -h /tmp");
+    console.log("Disk space status:", stdout);
+
+    // Parse the output to get the percentage used
+    const lines = stdout.trim().split("\n");
+    if (lines.length >= 2) {
+      const parts = lines[1].split(/\s+/);
+      if (parts.length >= 5) {
+        const percentUsed = parseInt(parts[4].replace("%", ""));
+        if (percentUsed > 80) {
+          console.warn(
+            `WARNING: Disk space is ${percentUsed}% full. Starting aggressive cleanup.`
+          );
+          // Clean up files aggressively when disk is over 80% full
+          await cleanupTempFiles(1); // Clean files older than 1 hour
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Error checking disk space:", error);
+  }
+};
+
 export async function POST(request) {
   console.log("Transcription API called");
+
+  // Run cleanup of old temp files
+  cleanupTempFiles().catch(console.error);
+
+  // Check available disk space
+  checkDiskSpace().catch(console.error);
+
   try {
     const formData = await request.formData();
     const file = formData.get("file");
@@ -235,11 +303,12 @@ export async function POST(request) {
     // For very large files, we'll save to disk first rather than loading into memory
     let buffer;
     let filePath;
+    let audioPath;
 
     if (file.size > 100 * 1024 * 1024) {
       // If file is larger than 100MB
       console.log("Large file detected, saving to disk first");
-      // Get file data as buffer - but in manageable chunks
+      // Get file data as buffer
       const bytes = await file.arrayBuffer();
       buffer = Buffer.from(bytes);
 
@@ -248,16 +317,16 @@ export async function POST(request) {
       filePath = await saveToDisk(buffer, uniqueFileName);
       console.log(`File saved to ${filePath}`);
 
-      // For very large files, we might want to extract just the audio
+      // For very large files, extract just the audio
       if (
         file.size > 500 * 1024 * 1024 &&
         (file.type.includes("video") ||
           file.name.match(/\.(mp4|mov|avi|mkv)$/i))
       ) {
         console.log("Extracting audio from large video file");
-        const audioPath = await extractAudioFromVideo(filePath);
-        // Read the audio file instead
-        buffer = require("fs").readFileSync(audioPath);
+        audioPath = await extractAudioFromVideo(filePath);
+        // Read the audio file
+        buffer = fs.readFileSync(audioPath);
         console.log(
           `Audio extracted to ${audioPath}, size: ${buffer.length} bytes`
         );
@@ -290,7 +359,7 @@ export async function POST(request) {
       `Calling Deepgram API with model: ${model}, language: ${language}`
     );
 
-    // Send audio file to Deepgram with proper timeout and error handling
+    // Send audio file to Deepgram with proper error handling
     let transcriptionResult;
     try {
       const { result, error } =
@@ -298,6 +367,23 @@ export async function POST(request) {
       transcriptionResult = { result, error };
     } catch (deepgramError) {
       console.error("Deepgram exception:", deepgramError);
+
+      // Clean up temporary files before returning error
+      if (audioPath) {
+        try {
+          await unlink(audioPath);
+        } catch (e) {
+          console.error("Failed to delete audio file:", e);
+        }
+      }
+      if (filePath && filePath !== audioPath) {
+        try {
+          await unlink(filePath);
+        } catch (e) {
+          console.error("Failed to delete video file:", e);
+        }
+      }
+
       return NextResponse.json(
         {
           error: `Deepgram API error: ${deepgramError.message}`,
@@ -310,6 +396,23 @@ export async function POST(request) {
 
     if (error) {
       console.error("Deepgram API error:", error);
+
+      // Clean up temporary files before returning error
+      if (audioPath) {
+        try {
+          await unlink(audioPath);
+        } catch (e) {
+          console.error("Failed to delete audio file:", e);
+        }
+      }
+      if (filePath && filePath !== audioPath) {
+        try {
+          await unlink(filePath);
+        } catch (e) {
+          console.error("Failed to delete video file:", e);
+        }
+      }
+
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
@@ -328,6 +431,17 @@ export async function POST(request) {
     const subtitles = convertSrtToSubtitles(srtContent);
 
     console.log(`Generated ${subtitles.length} subtitles`);
+
+    // Clean up the audio file which is no longer needed
+    if (audioPath) {
+      try {
+        await unlink(audioPath);
+      } catch (e) {
+        console.error("Failed to delete audio file:", e);
+      }
+    }
+
+    // Keep the original video file and SRT around for a bit, will be cleaned up later
 
     return NextResponse.json({
       subtitles,
