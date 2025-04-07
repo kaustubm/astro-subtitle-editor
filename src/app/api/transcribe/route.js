@@ -17,7 +17,9 @@ import {
   S3Client,
   PutObjectCommand,
   DeleteObjectCommand,
+  GetObjectCommand,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 // Create an S3 client using EC2 instance role
 const s3Client = new S3Client({
@@ -107,7 +109,7 @@ const convertSrtToSubtitles = (srtContent) => {
   });
 };
 
-// Upload file to S3 and return the URL
+// Upload file to S3 and return a pre-signed URL
 const uploadToS3 = async (filePath, fileName) => {
   try {
     const fileContent = await readFile(filePath);
@@ -134,13 +136,20 @@ const uploadToS3 = async (filePath, fileName) => {
 
     console.log(`File uploaded to S3: ${fileKey}`);
 
-    // Create S3 URL
-    const url = `https://${S3_BUCKET}.s3.${
-      process.env.AWS_REGION || "ap-southeast-1"
-    }.amazonaws.com/${fileKey}`;
+    // Generate a pre-signed URL that expires in 24 hours
+    const getObjectCommand = new GetObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: fileKey,
+    });
+
+    const signedUrl = await getSignedUrl(s3Client, getObjectCommand, {
+      expiresIn: 86400, // 24 hours in seconds
+    });
+
+    console.log(`Generated pre-signed URL: ${signedUrl}`);
 
     return {
-      url,
+      url: signedUrl,
       fileKey,
     };
   } catch (error) {
@@ -271,7 +280,7 @@ export async function POST(request) {
 
       console.log("Using S3 URL-based processing for large file");
 
-      // Upload to S3 and get URL
+      // Upload to S3 and get pre-signed URL
       const { url, fileKey } = await uploadToS3(filePath, file.name);
       s3FileKey = fileKey;
 
@@ -282,14 +291,14 @@ export async function POST(request) {
         "File uploaded to S3, sending to Deepgram"
       );
 
-      console.log(`Processing file from S3 URL: ${url}`);
+      console.log(`Processing file from pre-signed URL: ${url}`);
 
-      // Use URL-based transcription
+      // Use URL-based transcription with the pre-signed URL
       const { result: urlResult, error } =
         await deepgram.listen.prerecorded.transcribeUrl({ url }, options);
 
       if (error) {
-        throw new Error(`Deepgram API error: ${error.message}`);
+        throw new Error(`Deepgram API error: ${error}`);
       }
 
       result = urlResult;
@@ -327,7 +336,7 @@ export async function POST(request) {
         await deepgram.listen.prerecorded.transcribeFile(fileContent, options);
 
       if (error) {
-        throw new Error(`Deepgram API error: ${error.message}`);
+        throw new Error(`Deepgram API error: ${error}`);
       }
 
       result = fileResult;
