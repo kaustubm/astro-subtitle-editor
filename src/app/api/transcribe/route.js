@@ -1,4 +1,3 @@
-// // File: app/api/transcribe/route.js
 // import { NextResponse } from "next/server";
 // import { createClient } from "@deepgram/sdk";
 // import { srt } from "@deepgram/captions";
@@ -10,7 +9,7 @@
 // import Parser from "srt-parser-2";
 // import { pipeline } from "stream/promises";
 // import fs from "fs";
-// import { storeTranscriptionResult } from "./result/route";
+// import { setTimeout as sleep } from "timers/promises";
 
 // // AWS SDK imports
 // import {
@@ -20,54 +19,42 @@
 //   GetObjectCommand,
 // } from "@aws-sdk/client-s3";
 // import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+// import { fromIni } from "@aws-sdk/credential-providers";
 
-// // Create an S3 client using EC2 instance role
+// // Constants
+// const S3_BUCKET = process.env.S3_BUCKET || "deepgram-transcription-v2";
+// const S3_FOLDER = "temp-uploads/";
+// const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024; // 100MB
+// const MAX_TRANSCRIPTION_ATTEMPTS = 3;
+// const CLEANUP_DELAY_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// // Create S3 client
 // const s3Client = new S3Client({
 //   region: process.env.AWS_REGION || "ap-southeast-1",
+//   credentials: fromIni({
+//     profile: process.env.AWS_PROFILE || "cloudops-automation",
+//   }),
 // });
 
-// // S3 bucket configuration
-// const S3_BUCKET = process.env.S3_BUCKET || "deepgram-transcription";
-// const S3_FOLDER = "temp-uploads/";
-
-// // File size thresholds
-// const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024; // 100MB threshold for S3 approach
-
-// // Create temp directory if it doesn't exist
+// // Helper functions
 // const ensureTempDir = async () => {
 //   const tempDir = join(os.tmpdir(), "astro-subtitle-editor");
-//   try {
-//     await mkdir(tempDir, { recursive: true });
-//     console.log(`Temporary directory created at: ${tempDir}`);
-//     return tempDir;
-//   } catch (error) {
-//     console.error("Error creating temp directory:", error);
-//     throw new Error("Failed to create temporary directory");
-//   }
+//   await mkdir(tempDir, { recursive: true });
+//   return tempDir;
 // };
 
-// // Function to stream file to disk instead of loading it all in memory
 // const streamToDisk = async (file, filename) => {
 //   const tempDir = await ensureTempDir();
 //   const filePath = join(tempDir, filename);
-
-//   // Create a write stream to the destination path
 //   const writeStream = fs.createWriteStream(filePath);
-
-//   // Get the file's readable stream
 //   const readStream = file.stream();
-
-//   // Pipe the read stream to the write stream
 //   await pipeline(readStream, writeStream);
-
 //   return filePath;
 // };
 
-// // Function to safely delete a file
 // const deleteFile = async (filePath) => {
 //   try {
 //     await unlink(filePath);
-//     console.log(`Successfully deleted: ${filePath}`);
 //     return true;
 //   } catch (error) {
 //     console.error(`Error deleting file ${filePath}:`, error);
@@ -75,99 +62,65 @@
 //   }
 // };
 
-// // Function to parse SRT time format to seconds
 // const parseTimeToSeconds = (timeString) => {
 //   const [hours, minutes, secondsWithMillis] = timeString.split(":");
-//   const [seconds, milliseconds] = secondsWithMillis
-//     .replace(",", ".")
-//     .split(".");
-
+//   const [seconds, milliseconds] = secondsWithMillis.split(/[,.]/);
 //   return (
 //     parseFloat(hours) * 3600 +
 //     parseFloat(minutes) * 60 +
 //     parseFloat(seconds) +
-//     parseFloat(milliseconds || 0) / 1000
+//     parseFloat(milliseconds || "0") / 1000
 //   );
 // };
 
-// // Function to convert SRT to our app's subtitle format
 // const convertSrtToSubtitles = (srtContent) => {
 //   const parser = new Parser();
-//   const parsed = parser.fromSrt(srtContent);
-
-//   return parsed.map((item, index) => {
-//     // Handle time format with commas (00:00:00,000)
-//     const startTimeStr = item.startTime.replace(",", ".");
-//     const endTimeStr = item.endTime.replace(",", ".");
-
-//     return {
-//       id: index + 1,
-//       startTime: parseTimeToSeconds(startTimeStr),
-//       endTime: parseTimeToSeconds(endTimeStr),
-//       text: item.text,
-//     };
-//   });
+//   return parser.fromSrt(srtContent).map((item, index) => ({
+//     id: index + 1,
+//     startTime: parseTimeToSeconds(item.startTime.replace(",", ".")),
+//     endTime: parseTimeToSeconds(item.endTime.replace(",", ".")),
+//     text: item.text,
+//   }));
 // };
 
-// // Upload file to S3 and return a pre-signed URL
 // const uploadToS3 = async (filePath, fileName) => {
-//   try {
-//     const fileContent = await readFile(filePath);
-//     const fileKey = `${S3_FOLDER}${uuidv4()}-${fileName}`;
+//   const fileContent = await readFile(filePath);
+//   const fileKey = `${S3_FOLDER}${uuidv4()}-${fileName}`;
 
-//     // Get content type based on file extension
-//     let contentType = "application/octet-stream";
-//     if (fileName.endsWith(".mp4")) contentType = "video/mp4";
-//     else if (fileName.endsWith(".mp3")) contentType = "audio/mpeg";
-//     else if (fileName.endsWith(".wav")) contentType = "audio/wav";
-//     else if (fileName.endsWith(".avi")) contentType = "video/x-msvideo";
-//     else if (fileName.endsWith(".mov")) contentType = "video/quicktime";
-//     else if (fileName.endsWith(".mkv")) contentType = "video/x-matroska";
+//   const extension = fileName.split(".").pop()?.toLowerCase();
+//   const contentTypeMap = {
+//     mp4: "video/mp4",
+//     mp3: "audio/mpeg",
+//     wav: "audio/wav",
+//     avi: "video/x-msvideo",
+//     mov: "video/quicktime",
+//     mkv: "video/x-matroska",
+//   };
+//   const contentType = contentTypeMap[extension] || "application/octet-stream";
 
-//     // Upload to S3
-//     await s3Client.send(
-//       new PutObjectCommand({
-//         Bucket: S3_BUCKET,
-//         Key: fileKey,
-//         Body: fileContent,
-//         ContentType: contentType,
-//       })
-//     );
-
-//     console.log(`File uploaded to S3: ${fileKey}`);
-
-//     // Generate a pre-signed URL that expires in 24 hours
-//     const getObjectCommand = new GetObjectCommand({
+//   await s3Client.send(
+//     new PutObjectCommand({
 //       Bucket: S3_BUCKET,
 //       Key: fileKey,
-//     });
+//       Body: fileContent,
+//       ContentType: contentType,
+//     })
+//   );
 
-//     const signedUrl = await getSignedUrl(s3Client, getObjectCommand, {
-//       expiresIn: 86400, // 24 hours in seconds
-//     });
+//   const signedUrl = await getSignedUrl(
+//     s3Client,
+//     new GetObjectCommand({ Bucket: S3_BUCKET, Key: fileKey }),
+//     { expiresIn: 86400 }
+//   );
 
-//     console.log(`Generated pre-signed URL: ${signedUrl}`);
-
-//     return {
-//       url: signedUrl,
-//       fileKey,
-//     };
-//   } catch (error) {
-//     console.error("Error uploading to S3:", error);
-//     throw new Error(`Failed to upload to S3: ${error.message}`);
-//   }
+//   return { url: signedUrl, fileKey };
 // };
 
-// // Delete file from S3 after processing
 // const deleteFromS3 = async (fileKey) => {
 //   try {
 //     await s3Client.send(
-//       new DeleteObjectCommand({
-//         Bucket: S3_BUCKET,
-//         Key: fileKey,
-//       })
+//       new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: fileKey })
 //     );
-//     console.log(`Successfully deleted from S3: ${fileKey}`);
 //     return true;
 //   } catch (error) {
 //     console.error(`Error deleting from S3 ${fileKey}:`, error);
@@ -175,31 +128,16 @@
 //   }
 // };
 
-// // Function to update job progress
 // const updateJobProgress = async (jobId, progress, status, message) => {
 //   try {
 //     await fetch(`${process.env.NEXTAUTH_URL || ""}/api/progress`, {
 //       method: "POST",
-//       headers: {
-//         "Content-Type": "application/json",
-//       },
-//       body: JSON.stringify({
-//         jobId,
-//         progress,
-//         status,
-//         message,
-//       }),
+//       headers: { "Content-Type": "application/json" },
+//       body: JSON.stringify({ jobId, progress, status, message }),
 //     });
-//     return true;
 //   } catch (error) {
 //     console.error("Error updating job progress:", error);
-//     return false;
 //   }
-// };
-
-// // Determine if we should use the S3 approach based on file size
-// const isLargeFile = (size) => {
-//   return size > LARGE_FILE_THRESHOLD;
 // };
 
 // export async function POST(request) {
@@ -209,205 +147,122 @@
 //   const jobId = uuidv4();
 
 //   try {
-//     // Create initial job status
-//     await updateJobProgress(
-//       jobId,
-//       0,
-//       "initializing",
-//       "Starting transcription job"
-//     );
+//     await updateJobProgress(jobId, 0, "initializing", "Starting transcription");
 
 //     const formData = await request.formData();
 //     const file = formData.get("file");
 //     const language = formData.get("language") || "en";
 
 //     if (!file) {
-//       return NextResponse.json({ error: "No file provided" }, { status: 400 });
+//       throw new Error("No file provided");
 //     }
-
-//     const fileSize = file.size;
-//     console.log(
-//       `Processing file: ${file.name}, size: ${fileSize} bytes (${(
-//         fileSize /
-//         (1024 * 1024)
-//       ).toFixed(2)} MB)`
-//     );
 
 //     await updateJobProgress(jobId, 5, "processing", "Processing file upload");
 
-//     // Stream file to disk to avoid memory issues
 //     const uniqueFileName = `${uuidv4()}-${file.name}`;
 //     filePath = await streamToDisk(file, uniqueFileName);
-//     console.log(`File saved to disk at: ${filePath}`);
 
 //     await updateJobProgress(
 //       jobId,
 //       15,
 //       "processing",
-//       "File received, preparing for transcription"
+//       "Preparing for transcription"
 //     );
 
-//     // Initialize Deepgram client with longer timeout
-//     const deepgram = createClient(process.env.DEEPGRAM_API_KEY, {
-//       global: {
-//         fetch: {
-//           options: {
-//             timeout: 30 * 60 * 1000, // 30 minutes
-//           },
-//         },
-//       },
-//     });
-
-//     // Configure transcription options
+//     const deepgram = createClient(process.env.DEEPGRAM_API_KEY || "");
 //     const options = {
 //       model: language === "en" ? "nova-3" : "nova-2",
 //       smart_format: true,
-//       utterances: false,
 //       punctuate: true,
-//       diarize: false,
-//       language: language,
+//       language,
 //     };
 
 //     let result;
 
-//     if (isLargeFile(fileSize)) {
+//     if (file.size > LARGE_FILE_THRESHOLD) {
 //       await updateJobProgress(
 //         jobId,
 //         25,
 //         "processing",
-//         "Large file detected, uploading to S3"
+//         "Uploading large file to S3"
 //       );
 
-//       console.log("Using S3 URL-based processing for large file");
-
-//       // Upload to S3 and get pre-signed URL
 //       const { url, fileKey } = await uploadToS3(filePath, file.name);
 //       s3FileKey = fileKey;
 
-//       await updateJobProgress(
-//         jobId,
-//         40,
-//         "processing",
-//         "File uploaded to S3, sending to Deepgram"
-//       );
+//       let attempts = 0;
+//       let transcriptionError = null;
 
-//       console.log(`Processing file from pre-signed URL: ${url}`);
+//       while (attempts < MAX_TRANSCRIPTION_ATTEMPTS) {
+//         attempts++;
+//         try {
+//           await updateJobProgress(
+//             jobId,
+//             40 + (attempts - 1) * 10,
+//             "processing",
+//             `Transcription attempt ${attempts}/${MAX_TRANSCRIPTION_ATTEMPTS}`
+//           );
 
-//       // Use URL-based transcription with the pre-signed URL
-//       const { result: urlResult, error } =
-//         await deepgram.listen.prerecorded.transcribeUrl({ url }, options);
+//           const response = await deepgram.listen.prerecorded.transcribeUrl(
+//             { url },
+//             options
+//           );
 
-//       if (error) {
-//         throw new Error(`Deepgram API error: ${error}`);
+//           if (response.error) throw response.error;
+//           result = response.result;
+//           break;
+//         } catch (error) {
+//           transcriptionError = error;
+//           if (attempts < MAX_TRANSCRIPTION_ATTEMPTS) {
+//             await sleep(5000 * Math.pow(2, attempts - 1));
+//           }
+//         }
 //       }
 
-//       result = urlResult;
+//       if (!result) {
+//         throw (
+//           transcriptionError || new Error("All transcription attempts failed")
+//         );
+//       }
 
-//       await updateJobProgress(
-//         jobId,
-//         75,
-//         "processing",
-//         "Transcription completed, generating subtitles"
-//       );
-
-//       // We can delete the local file now since S3 has it
 //       await deleteFile(filePath);
 //       filePath = null;
 //     } else {
-//       await updateJobProgress(
-//         jobId,
-//         25,
-//         "processing",
-//         "Processing file for transcription"
+//       const fileStream = fs.createReadStream(filePath);
+//       const response = await deepgram.listen.prerecorded.transcribeFile(
+//         fileStream,
+//         options
 //       );
-
-//       console.log("Using direct file processing for smaller file");
-//       const fileContent = await readFile(filePath);
-//       console.log(`File read complete. Size: ${fileContent.length} bytes`);
-
-//       await updateJobProgress(
-//         jobId,
-//         40,
-//         "processing",
-//         "Sending to Deepgram for transcription"
-//       );
-
-//       const { result: fileResult, error } =
-//         await deepgram.listen.prerecorded.transcribeFile(fileContent, options);
-
-//       if (error) {
-//         throw new Error(`Deepgram API error: ${error}`);
-//       }
-
-//       result = fileResult;
-
-//       await updateJobProgress(
-//         jobId,
-//         75,
-//         "processing",
-//         "Transcription completed, generating subtitles"
-//       );
+//       if (response.error) throw response.error;
+//       result = response.result;
 //     }
 
-//     console.log("Transcription completed successfully");
+//     await updateJobProgress(jobId, 75, "processing", "Generating subtitles");
 
-//     // Use the built-in SRT formatter from Deepgram
 //     const srtContent = srt(result);
-
-//     // Save SRT file
-//     const srtFileName = `${uuidv4()}.srt`;
-//     srtPath = join(await ensureTempDir(), srtFileName);
+//     const tempDir = await ensureTempDir();
+//     srtPath = join(tempDir, `${uuidv4()}.srt`);
 //     await writeFile(srtPath, srtContent);
-//     console.log(`SRT file saved to: ${srtPath}`);
 
-//     // Convert SRT to our app's subtitle format
-//     const subtitles = convertSrtToSubtitles(srtContent);
-
-//     await updateJobProgress(
-//       jobId,
-//       100,
-//       "completed",
-//       "Transcription job completed successfully"
-//     );
-
-//     // Create the response object
 //     const response = {
 //       jobId,
-//       subtitles,
+//       subtitles: convertSrtToSubtitles(srtContent),
 //       srtContent,
-//       srtPath,
-//       filePath,
 //       confidence:
 //         result.results?.channels?.[0]?.alternatives?.[0]?.confidence || 0,
 //     };
 
-//     // Also save the result to disk for persistence
-//     try {
-//       const tempDir = await ensureTempDir();
-//       const resultPath = join(tempDir, `${jobId}-result.json`);
-//       await writeFile(resultPath, JSON.stringify(response));
-//       console.log(`Saved transcription result to: ${resultPath}`);
-//     } catch (error) {
-//       console.error("Error saving transcription result to disk:", error);
-//       // Continue even if saving fails
-//     }
+//     await updateJobProgress(jobId, 100, "completed", "Transcription completed");
 
-//     // Store result in memory for later retrieval
-//     storeTranscriptionResult(jobId, response);
-
-//     // Schedule cleanup of temporary files and S3 objects for 24 hours later
-//     // This gives users plenty of time to use the editor
 //     setTimeout(async () => {
 //       if (filePath) await deleteFile(filePath);
 //       if (srtPath) await deleteFile(srtPath);
 //       if (s3FileKey) await deleteFromS3(s3FileKey);
-//     }, 24 * 60 * 60 * 1000); // Clean up after 24 hours
+//     }, CLEANUP_DELAY_MS);
 
 //     return NextResponse.json(response);
 //   } catch (error) {
 //     console.error("Transcription error:", error);
-
-//     // Update job status to failed
 //     await updateJobProgress(
 //       jobId,
 //       0,
@@ -415,23 +270,19 @@
 //       `Transcription failed: ${error.message || "Unknown error"}`
 //     );
 
-//     // Clean up files if there was an error
-//     if (filePath) await deleteFile(filePath);
-//     if (srtPath) await deleteFile(srtPath);
-//     if (s3FileKey) await deleteFromS3(s3FileKey);
+//     const cleanupPromises = [];
+//     if (filePath) cleanupPromises.push(deleteFile(filePath));
+//     if (srtPath) cleanupPromises.push(deleteFile(srtPath));
+//     if (s3FileKey) cleanupPromises.push(deleteFromS3(s3FileKey));
+//     await Promise.all(cleanupPromises);
 
 //     return NextResponse.json(
-//       {
-//         jobId,
-//         error: error.message || "Unknown error during transcription",
-//         details: error.toString(),
-//       },
+//       { jobId, error: error.message || "Unknown error" },
 //       { status: 500 }
 //     );
 //   }
 // }
 
-// File: app/api/transcribe/route.js
 import { NextResponse } from "next/server";
 import { createClient } from "@deepgram/sdk";
 import { srt } from "@deepgram/captions";
@@ -444,7 +295,6 @@ import Parser from "srt-parser-2";
 import { pipeline } from "stream/promises";
 import fs from "fs";
 import { setTimeout as sleep } from "timers/promises";
-import { storeTranscriptionResult } from "./result/route";
 
 // AWS SDK imports
 import {
@@ -454,79 +304,42 @@ import {
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { fromIni } from "@aws-sdk/credential-providers";
 
-// Create an S3 client using EC2 instance role
+// Constants
+const S3_BUCKET = process.env.S3_BUCKET || "deepgram-transcription-v2";
+const S3_FOLDER = "temp-uploads/";
+const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024; // 100MB
+const MAX_TRANSCRIPTION_ATTEMPTS = 3;
+const CLEANUP_DELAY_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Create S3 client
 const s3Client = new S3Client({
   region: process.env.AWS_REGION || "ap-southeast-1",
+  credentials: fromIni({
+    profile: process.env.AWS_PROFILE || "cloudops-automation",
+  }),
 });
 
-// S3 bucket configuration
-const S3_BUCKET = process.env.S3_BUCKET || "deepgram-transcription";
-const S3_FOLDER = "temp-uploads/";
-
-// File size thresholds
-const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024; // 100MB threshold for S3 approach
-
-// Retry utility function
-const fetchWithRetry = async (url, options, maxRetries = 3, delay = 2000) => {
-  let lastError;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.log(`Attempt ${attempt}/${maxRetries} to fetch from ${url}`);
-      const response = await fetch(url, options);
-      return response;
-    } catch (error) {
-      console.warn(`Fetch attempt ${attempt} failed:`, error.message);
-      lastError = error;
-
-      if (attempt < maxRetries) {
-        console.log(`Waiting ${delay / 1000} seconds before retry...`);
-        await sleep(delay);
-        // Increase delay for next attempt (exponential backoff)
-        delay = delay * 1.5;
-      }
-    }
-  }
-
-  throw lastError;
-};
-
-// Create temp directory if it doesn't exist
+// Helper functions
 const ensureTempDir = async () => {
   const tempDir = join(os.tmpdir(), "astro-subtitle-editor");
-  try {
-    await mkdir(tempDir, { recursive: true });
-    console.log(`Temporary directory created at: ${tempDir}`);
-    return tempDir;
-  } catch (error) {
-    console.error("Error creating temp directory:", error);
-    throw new Error("Failed to create temporary directory");
-  }
+  await mkdir(tempDir, { recursive: true });
+  return tempDir;
 };
 
-// Function to stream file to disk instead of loading it all in memory
 const streamToDisk = async (file, filename) => {
   const tempDir = await ensureTempDir();
   const filePath = join(tempDir, filename);
-
-  // Create a write stream to the destination path
   const writeStream = fs.createWriteStream(filePath);
-
-  // Get the file's readable stream
   const readStream = file.stream();
-
-  // Pipe the read stream to the write stream
   await pipeline(readStream, writeStream);
-
   return filePath;
 };
 
-// Function to safely delete a file
 const deleteFile = async (filePath) => {
   try {
     await unlink(filePath);
-    console.log(`Successfully deleted: ${filePath}`);
     return true;
   } catch (error) {
     console.error(`Error deleting file ${filePath}:`, error);
@@ -534,99 +347,65 @@ const deleteFile = async (filePath) => {
   }
 };
 
-// Function to parse SRT time format to seconds
 const parseTimeToSeconds = (timeString) => {
   const [hours, minutes, secondsWithMillis] = timeString.split(":");
-  const [seconds, milliseconds] = secondsWithMillis
-    .replace(",", ".")
-    .split(".");
-
+  const [seconds, milliseconds] = secondsWithMillis.split(/[,.]/);
   return (
     parseFloat(hours) * 3600 +
     parseFloat(minutes) * 60 +
     parseFloat(seconds) +
-    parseFloat(milliseconds || 0) / 1000
+    parseFloat(milliseconds || "0") / 1000
   );
 };
 
-// Function to convert SRT to our app's subtitle format
 const convertSrtToSubtitles = (srtContent) => {
   const parser = new Parser();
-  const parsed = parser.fromSrt(srtContent);
-
-  return parsed.map((item, index) => {
-    // Handle time format with commas (00:00:00,000)
-    const startTimeStr = item.startTime.replace(",", ".");
-    const endTimeStr = item.endTime.replace(",", ".");
-
-    return {
-      id: index + 1,
-      startTime: parseTimeToSeconds(startTimeStr),
-      endTime: parseTimeToSeconds(endTimeStr),
-      text: item.text,
-    };
-  });
+  return parser.fromSrt(srtContent).map((item, index) => ({
+    id: index + 1,
+    startTime: parseTimeToSeconds(item.startTime.replace(",", ".")),
+    endTime: parseTimeToSeconds(item.endTime.replace(",", ".")),
+    text: item.text,
+  }));
 };
 
-// Upload file to S3 and return a pre-signed URL
 const uploadToS3 = async (filePath, fileName) => {
-  try {
-    const fileContent = await readFile(filePath);
-    const fileKey = `${S3_FOLDER}${uuidv4()}-${fileName}`;
+  const fileContent = await readFile(filePath);
+  const fileKey = `${S3_FOLDER}${uuidv4()}-${fileName}`;
 
-    // Get content type based on file extension
-    let contentType = "application/octet-stream";
-    if (fileName.endsWith(".mp4")) contentType = "video/mp4";
-    else if (fileName.endsWith(".mp3")) contentType = "audio/mpeg";
-    else if (fileName.endsWith(".wav")) contentType = "audio/wav";
-    else if (fileName.endsWith(".avi")) contentType = "video/x-msvideo";
-    else if (fileName.endsWith(".mov")) contentType = "video/quicktime";
-    else if (fileName.endsWith(".mkv")) contentType = "video/x-matroska";
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  const contentTypeMap = {
+    mp4: "video/mp4",
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    avi: "video/x-msvideo",
+    mov: "video/quicktime",
+    mkv: "video/x-matroska",
+  };
+  const contentType = contentTypeMap[extension] || "application/octet-stream";
 
-    // Upload to S3
-    await s3Client.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: fileKey,
-        Body: fileContent,
-        ContentType: contentType,
-      })
-    );
-
-    console.log(`File uploaded to S3: ${fileKey}`);
-
-    // Generate a pre-signed URL that expires in 24 hours
-    const getObjectCommand = new GetObjectCommand({
+  await s3Client.send(
+    new PutObjectCommand({
       Bucket: S3_BUCKET,
       Key: fileKey,
-    });
+      Body: fileContent,
+      ContentType: contentType,
+    })
+  );
 
-    const signedUrl = await getSignedUrl(s3Client, getObjectCommand, {
-      expiresIn: 86400, // 24 hours in seconds
-    });
+  const signedUrl = await getSignedUrl(
+    s3Client,
+    new GetObjectCommand({ Bucket: S3_BUCKET, Key: fileKey }),
+    { expiresIn: 86400 }
+  );
 
-    console.log(`Generated pre-signed URL: ${signedUrl}`);
-
-    return {
-      url: signedUrl,
-      fileKey,
-    };
-  } catch (error) {
-    console.error("Error uploading to S3:", error);
-    throw new Error(`Failed to upload to S3: ${error.message}`);
-  }
+  return { url: signedUrl, fileKey };
 };
 
-// Delete file from S3 after processing
 const deleteFromS3 = async (fileKey) => {
   try {
     await s3Client.send(
-      new DeleteObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: fileKey,
-      })
+      new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: fileKey })
     );
-    console.log(`Successfully deleted from S3: ${fileKey}`);
     return true;
   } catch (error) {
     console.error(`Error deleting from S3 ${fileKey}:`, error);
@@ -634,328 +413,214 @@ const deleteFromS3 = async (fileKey) => {
   }
 };
 
-// Function to update job progress
 const updateJobProgress = async (jobId, progress, status, message) => {
   try {
-    await fetch(`${process.env.NEXTAUTH_URL || ""}/api/progress`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        jobId,
-        progress,
-        status,
-        message,
-      }),
-    });
-    return true;
+    const response = await fetch(
+      `${process.env.NEXTAUTH_URL || ""}/api/progress`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId, progress, status, message }),
+      }
+    );
+
+    if (!response.ok) {
+      console.error("Failed to update progress:", await response.text());
+    }
   } catch (error) {
     console.error("Error updating job progress:", error);
-    return false;
   }
-};
-
-// Determine if we should use the S3 approach based on file size
-const isLargeFile = (size) => {
-  return size > LARGE_FILE_THRESHOLD;
 };
 
 export async function POST(request) {
   let filePath = null;
   let srtPath = null;
   let s3FileKey = null;
-  const jobId = uuidv4();
+  let clientJobId = null;
 
   try {
-    // Create initial job status
-    await updateJobProgress(
-      jobId,
-      0,
-      "initializing",
-      "Starting transcription job"
-    );
-
     const formData = await request.formData();
     const file = formData.get("file");
     const language = formData.get("language") || "en";
+    clientJobId = formData.get("jobId") || uuidv4();
 
     if (!file) {
-      return NextResponse.json({ error: "No file provided" }, { status: 400 });
+      throw new Error("No file provided");
     }
 
-    const fileSize = file.size;
-    console.log(
-      `Processing file: ${file.name}, size: ${fileSize} bytes (${(
-        fileSize /
-        (1024 * 1024)
-      ).toFixed(2)} MB)`
+    // Initial progress update
+    await updateJobProgress(
+      clientJobId,
+      0,
+      "initializing",
+      "Starting transcription"
     );
 
-    await updateJobProgress(jobId, 5, "processing", "Processing file upload");
-
-    // Stream file to disk to avoid memory issues
+    // File processing
+    await updateJobProgress(
+      clientJobId,
+      5,
+      "processing",
+      "Processing file upload"
+    );
     const uniqueFileName = `${uuidv4()}-${file.name}`;
     filePath = await streamToDisk(file, uniqueFileName);
-    console.log(`File saved to disk at: ${filePath}`);
-
     await updateJobProgress(
-      jobId,
+      clientJobId,
       15,
       "processing",
-      "File received, preparing for transcription"
+      "Preparing for transcription"
     );
 
-    // Configure transcription options
+    // Deepgram setup
+    const deepgram = createClient(process.env.DEEPGRAM_API_KEY || "");
     const options = {
       model: language === "en" ? "nova-3" : "nova-2",
       smart_format: true,
-      utterances: false,
       punctuate: true,
-      diarize: false,
-      language: language,
+      language,
     };
 
     let result;
 
-    if (isLargeFile(fileSize)) {
+    if (file.size > LARGE_FILE_THRESHOLD) {
+      // Large file processing
       await updateJobProgress(
-        jobId,
+        clientJobId,
         25,
         "processing",
-        "Large file detected, uploading to S3"
+        "Uploading large file to S3"
       );
-
-      console.log("Using S3 URL-based processing for large file");
-
-      // Upload to S3 and get pre-signed URL
       const { url, fileKey } = await uploadToS3(filePath, file.name);
       s3FileKey = fileKey;
-
       await updateJobProgress(
-        jobId,
-        40,
+        clientJobId,
+        35,
         "processing",
-        "File uploaded to S3, sending to Deepgram"
+        "File uploaded, starting transcription"
       );
 
-      console.log(`Processing file from pre-signed URL: ${url}`);
+      let attempts = 0;
+      let transcriptionError = null;
 
-      try {
-        // Configure Deepgram with more robust settings
-        const robustDeepgram = createClient(process.env.DEEPGRAM_API_KEY, {
-          global: {
-            fetch: {
-              options: {
-                timeout: 60 * 60 * 1000, // 60 minutes timeout
-                keepalive: true,
-                signal: AbortSignal.timeout(60 * 60 * 1000),
-              },
-            },
-          },
-        });
+      while (attempts < MAX_TRANSCRIPTION_ATTEMPTS) {
+        attempts++;
+        try {
+          await updateJobProgress(
+            clientJobId,
+            40 + (attempts - 1) * 10,
+            "processing",
+            `Transcription attempt ${attempts}/${MAX_TRANSCRIPTION_ATTEMPTS}`
+          );
 
-        // Set retries for URL-based transcription
-        let transcriptionAttempt = 0;
-        const maxTranscriptionAttempts = 3;
-        let transcriptionError = null;
-        let urlResult = null;
+          const { result: transcriptionResult, error } =
+            await deepgram.listen.prerecorded.transcribeUrl({ url }, options);
 
-        while (transcriptionAttempt < maxTranscriptionAttempts && !urlResult) {
-          transcriptionAttempt++;
+          if (error) throw error;
+          result = transcriptionResult;
 
-          try {
-            console.log(
-              `Transcription attempt ${transcriptionAttempt}/${maxTranscriptionAttempts}`
-            );
-
-            // Update progress with current attempt
-            await updateJobProgress(
-              jobId,
-              40 + (transcriptionAttempt - 1) * 10,
-              "processing",
-              `Sending to Deepgram (attempt ${transcriptionAttempt}/${maxTranscriptionAttempts})`
-            );
-
-            const response =
-              await robustDeepgram.listen.prerecorded.transcribeUrl(
-                { url },
-                options
-              );
-
-            if (response.error) {
-              throw new Error(`Deepgram API error: ${response.error}`);
-            }
-
-            urlResult = response.result;
-            console.log("Transcription completed successfully");
-          } catch (error) {
-            transcriptionError = error;
-            console.error(
-              `Transcription attempt ${transcriptionAttempt} failed:`,
-              error
-            );
-
-            if (transcriptionAttempt < maxTranscriptionAttempts) {
-              // Wait before retry with exponential backoff
-              const retryDelay = 5000 * Math.pow(2, transcriptionAttempt - 1);
-              console.log(
-                `Waiting ${retryDelay / 1000} seconds before retry...`
-              );
-              await sleep(retryDelay);
-            }
+          // Update progress based on actual transcription progress
+          await updateJobProgress(
+            clientJobId,
+            80,
+            "processing",
+            "Transcription in progress"
+          );
+          break;
+        } catch (error) {
+          transcriptionError = error;
+          if (attempts < MAX_TRANSCRIPTION_ATTEMPTS) {
+            await sleep(5000 * Math.pow(2, attempts - 1));
           }
         }
+      }
 
-        // If all attempts failed, throw the last error
-        if (!urlResult) {
-          throw (
-            transcriptionError || new Error("All transcription attempts failed")
-          );
-        }
-
-        result = urlResult;
-
-        await updateJobProgress(
-          jobId,
-          75,
-          "processing",
-          "Transcription completed, generating subtitles"
-        );
-
-        // We can delete the local file now since S3 has it
-        await deleteFile(filePath);
-        filePath = null;
-      } catch (error) {
-        console.error("Transcription failed with all retry attempts:", error);
-        throw new Error(
-          `Deepgram transcription failed after multiple attempts: ${error.message}`
+      if (!result) {
+        throw (
+          transcriptionError || new Error("All transcription attempts failed")
         );
       }
+
+      await deleteFile(filePath);
+      filePath = null;
     } else {
+      // Small file processing
       await updateJobProgress(
-        jobId,
-        25,
+        clientJobId,
+        30,
         "processing",
-        "Processing file for transcription"
+        "Starting transcription"
       );
+      const fileStream = fs.createReadStream(filePath);
+      const { result: transcriptionResult, error } =
+        await deepgram.listen.prerecorded.transcribeFile(fileStream, options);
 
-      console.log("Using direct file processing for smaller file");
-      const fileContent = await readFile(filePath);
-      console.log(`File read complete. Size: ${fileContent.length} bytes`);
+      if (error) throw error;
+      result = transcriptionResult;
 
+      // Update progress during processing
       await updateJobProgress(
-        jobId,
-        40,
+        clientJobId,
+        70,
         "processing",
-        "Sending to Deepgram for transcription"
-      );
-
-      // Initialize Deepgram client with longer timeout
-      const deepgram = createClient(process.env.DEEPGRAM_API_KEY, {
-        global: {
-          fetch: {
-            options: {
-              timeout: 30 * 60 * 1000, // 30 minutes
-            },
-          },
-        },
-      });
-
-      const { result: fileResult, error } =
-        await deepgram.listen.prerecorded.transcribeFile(fileContent, options);
-
-      if (error) {
-        throw new Error(`Deepgram API error: ${error}`);
-      }
-
-      result = fileResult;
-
-      await updateJobProgress(
-        jobId,
-        75,
-        "processing",
-        "Transcription completed, generating subtitles"
+        "Transcription in progress"
       );
     }
 
-    console.log("Transcription completed successfully");
-
-    // Use the built-in SRT formatter from Deepgram
-    const srtContent = srt(result);
-
-    // Save SRT file
-    const srtFileName = `${uuidv4()}.srt`;
-    srtPath = join(await ensureTempDir(), srtFileName);
-    await writeFile(srtPath, srtContent);
-    console.log(`SRT file saved to: ${srtPath}`);
-
-    // Convert SRT to our app's subtitle format
-    const subtitles = convertSrtToSubtitles(srtContent);
-
+    // Post-processing
     await updateJobProgress(
-      jobId,
-      100,
-      "completed",
-      "Transcription job completed successfully"
+      clientJobId,
+      85,
+      "processing",
+      "Generating subtitles"
     );
+    const srtContent = srt(result);
+    const tempDir = await ensureTempDir();
+    srtPath = join(tempDir, `${uuidv4()}.srt`);
+    await writeFile(srtPath, srtContent);
 
-    // Create the response object
     const response = {
-      jobId,
-      subtitles,
+      jobId: clientJobId,
+      subtitles: convertSrtToSubtitles(srtContent),
       srtContent,
-      srtPath,
-      filePath,
       confidence:
         result.results?.channels?.[0]?.alternatives?.[0]?.confidence || 0,
     };
 
-    // Also save the result to disk for persistence
-    try {
-      const tempDir = await ensureTempDir();
-      const resultPath = join(tempDir, `${jobId}-result.json`);
-      await writeFile(resultPath, JSON.stringify(response));
-      console.log(`Saved transcription result to: ${resultPath}`);
-    } catch (error) {
-      console.error("Error saving transcription result to disk:", error);
-      // Continue even if saving fails
-    }
+    // Final completion
+    await updateJobProgress(
+      clientJobId,
+      100,
+      "completed",
+      "Transcription completed"
+    );
 
-    // Store result in memory for later retrieval
-    storeTranscriptionResult(jobId, response);
-
-    // Schedule cleanup of temporary files and S3 objects for 24 hours later
-    // This gives users plenty of time to use the editor
+    // Cleanup
     setTimeout(async () => {
       if (filePath) await deleteFile(filePath);
       if (srtPath) await deleteFile(srtPath);
       if (s3FileKey) await deleteFromS3(s3FileKey);
-    }, 24 * 60 * 60 * 1000); // Clean up after 24 hours
+    }, CLEANUP_DELAY_MS);
 
     return NextResponse.json(response);
   } catch (error) {
     console.error("Transcription error:", error);
-
-    // Update job status to failed
     await updateJobProgress(
-      jobId,
+      clientJobId || uuidv4(),
       0,
       "failed",
       `Transcription failed: ${error.message || "Unknown error"}`
     );
 
-    // Clean up files if there was an error
-    if (filePath) await deleteFile(filePath);
-    if (srtPath) await deleteFile(srtPath);
-    if (s3FileKey) await deleteFromS3(s3FileKey);
+    // Cleanup on error
+    const cleanupPromises = [];
+    if (filePath) cleanupPromises.push(deleteFile(filePath));
+    if (srtPath) cleanupPromises.push(deleteFile(srtPath));
+    if (s3FileKey) cleanupPromises.push(deleteFromS3(s3FileKey));
+    await Promise.all(cleanupPromises);
 
     return NextResponse.json(
-      {
-        jobId,
-        error: error.message || "Unknown error during transcription",
-        details: error.toString(),
-      },
+      { jobId: clientJobId, error: error.message || "Unknown error" },
       { status: 500 }
     );
   }
